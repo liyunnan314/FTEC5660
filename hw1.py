@@ -52,22 +52,13 @@ def image_data_url(path: Path) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-# ---------------------------------------------------------------------------
-# Student solution starts here. Nothing below touches the provided runner code.
-# ---------------------------------------------------------------------------
-
 MODEL_NAME = "deepseek-v4-flash-vision-exp"
-# Independent reads per receipt; the per-field median across votes is kept so a
-# single mis-read digit cannot move the final sum.
 VOTES_PER_RECEIPT = 7
-# Extra votes added when the first round cannot agree. With seven votes a wrong
-# majority always shows up as disagreement, so it always triggers these.
 EXTRA_VOTES_ON_DISAGREEMENT = 4
+MAX_VOTES_PER_RECEIPT = 21
+MIN_AGREEMENT = 0.6
 MAX_CONCURRENCY = 6
-# amount_without_discounts must equal subtotal + discount_total exactly; a read
-# that breaks this identity is internally inconsistent and gets thrown away.
 CONSISTENCY_TOLERANCE = Decimal("0.02")
-# The cash a shopper hands over differs from the subtotal only by rounding.
 MAX_ROUNDING_GAP = Decimal("1.00")
 
 EXTRACTION_PROMPT = """You are a meticulous cashier auditor reading a photograph of a Hong Kong \
@@ -125,7 +116,6 @@ line, because a label sometimes quotes a different figure than the amount column
 
 
 def _strip_fences(text: str) -> str:
-    """Remove markdown code fences and keep only the outermost JSON object."""
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```[a-zA-Z]*\s*", "", cleaned)
@@ -137,7 +127,6 @@ def _strip_fences(text: str) -> str:
 
 
 def _to_decimal(value: Any) -> Decimal | None:
-    """Coerce a JSON scalar such as 394.7, "HK$1,234.50" or None to Decimal."""
     if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
@@ -162,7 +151,6 @@ def _to_decimal(value: Any) -> Decimal | None:
 
 
 def _parse_receipt_json(text: str) -> dict[str, Decimal] | None:
-    """Turn one model response into the three numeric fields, or None."""
     data = None
     try:
         parsed = json.loads(_strip_fences(text))
@@ -183,16 +171,12 @@ def _parse_receipt_json(text: str) -> dict[str, Decimal] | None:
         return None
     fields["discount"] = abs(fields["discount"]) if fields["discount"] is not None else Decimal("0")
 
-    # Self-check 1: the listed discount lines must re-add to discount_total.
-    # Self-check 2: gross must equal subtotal + discount_total.
-    # A read that breaks either identity has mis-read a line, so vote it down.
     lines = data.get("discount_lines")
     line_sum = None
     if isinstance(lines, list) and lines:
         parsed_lines = []
         for line in lines:
             if isinstance(line, dict):
-                # {"text": "Buy 2 Save $6.", "amount": -6.00}
                 parsed_lines.append(_to_decimal(line.get("amount", line.get("value"))))
             else:
                 parsed_lines.append(_to_decimal(line))
@@ -213,7 +197,6 @@ def _parse_receipt_json(text: str) -> dict[str, Decimal] | None:
 
 
 def _median(values: list[Decimal]) -> Decimal:
-    """Median of a non-empty list."""
     ordered = sorted(values)
     size = len(ordered)
     if size % 2:
@@ -222,14 +205,6 @@ def _median(values: list[Decimal]) -> Decimal:
 
 
 def _consensus(values: list[Decimal]) -> Decimal:
-    """Agree on one value across votes.
-
-    Receipt reading is a transcription task, so the answers are discrete: if two
-    reads say 76.71 and one says 100.21, the truth is 76.71. Prefer the modal
-    value and only fall back to the median when there is no clear winner, which
-    avoids averaging two different readings into an amount that was never on the
-    receipt.
-    """
     from collections import Counter
 
     counts = Counter(values)
@@ -237,6 +212,24 @@ def _consensus(values: list[Decimal]) -> Decimal:
     if len(ranking) == 1 or ranking[0][1] > ranking[1][1]:
         return ranking[0][0]
     return _median(values)
+
+
+def _needs_more_votes(reads: list[dict]) -> bool:
+    from collections import Counter
+
+    if len(reads) < 2:
+        return True
+    if any(not read["consistent"] for read in reads):
+        return True
+    if any(read["rounding_gap"] > MAX_ROUNDING_GAP for read in reads):
+        return True
+    for key in ("paid", "subtotal", "discount"):
+        values = [read[key] for read in reads]
+        if max(values) - min(values) <= CONSISTENCY_TOLERANCE:
+            continue
+        if Counter(values).most_common(1)[0][1] / len(values) < MIN_AGREEMENT:
+            return True
+    return False
 
 
 def _quantize(value: Decimal) -> Decimal:
@@ -263,8 +256,6 @@ def build_chain() -> Any:
 
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
-        # The runner normally does this first; repeat it so the chain also
-        # builds when build_chain() is called on its own.
         load_env_file()
         api_key = os.environ.get("DEEPSEEK_API_KEY")
     if api_key:
@@ -279,7 +270,6 @@ def build_chain() -> Any:
     )
 
     def to_messages(inputs: dict) -> list[HumanMessage]:
-        """Build one multimodal extraction message for a single receipt."""
         extra = inputs.get("instruction") or ""
         content: list[dict] = [
             {"type": "text", "text": EXTRACTION_PROMPT + extra},
@@ -311,7 +301,7 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
             return []
         try:
             return list(chain.batch(jobs, config={"max_concurrency": MAX_CONCURRENCY}))
-        except Exception as error:  # one bad image must not sink the run
+        except Exception as error:
             print(f"[hw1] batch failed ({error}); falling back to per-image calls")
             outputs: list[str] = []
             for job in jobs:
@@ -322,7 +312,6 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
                     outputs.append("")
             return outputs
 
-    # Pass 1: VOTES_PER_RECEIPT independent reads for every receipt, in parallel.
     votes: dict[Path, list[dict[str, Decimal]]] = {path: [] for path in images}
     jobs = [{"path": path, "instruction": ""} for path in images for _ in range(VOTES_PER_RECEIPT)]
     for path, text in zip([job["path"] for job in jobs], run_batch(jobs)):
@@ -330,33 +319,24 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
         if parsed is not None:
             votes[path].append(parsed)
 
-    # Pass 2: receipts whose reads were internally inconsistent, disagreed by
-    # more than a cent, or showed an implausible rounding gap get extra votes.
-    # Plain re-reads are used rather than a "look harder" prompt: measured on the
-    # public receipts, that instruction roughly doubles the mis-read rate, while
-    # simply taking more samples lets the majority vote win.
-    tough_jobs = []
-    for path, reads in votes.items():
-        if len(reads) < 2 or any(not read["consistent"] for read in reads):
-            tough_jobs.extend({"path": path, "instruction": ""} for _ in range(EXTRA_VOTES_ON_DISAGREEMENT))
-            continue
-        if any(read["rounding_gap"] > MAX_ROUNDING_GAP for read in reads):
-            tough_jobs.extend({"path": path, "instruction": ""} for _ in range(EXTRA_VOTES_ON_DISAGREEMENT))
-            continue
-        if any(
-            max(read[key] for read in reads) - min(read[key] for read in reads)
-            > CONSISTENCY_TOLERANCE
-            for key in ("paid", "subtotal", "discount")
-        ):
-            tough_jobs.extend({"path": path, "instruction": ""} for _ in range(EXTRA_VOTES_ON_DISAGREEMENT))
+    # 读不稳的收据继续加票，直到某个值明显占多数
+    while True:
+        pending: list[dict] = []
+        for path, reads in votes.items():
+            if len(reads) >= MAX_VOTES_PER_RECEIPT:
+                continue
+            if _needs_more_votes(reads):
+                pending.extend(
+                    {"path": path, "instruction": ""}
+                    for _ in range(EXTRA_VOTES_ON_DISAGREEMENT)
+                )
+        if not pending:
+            break
+        for path, text in zip([job["path"] for job in pending], run_batch(pending)):
+            parsed = _parse_receipt_json(text)
+            if parsed is not None:
+                votes[path].append(parsed)
 
-    for path, text in zip([job["path"] for job in tough_jobs], run_batch(tough_jobs)):
-        parsed = _parse_receipt_json(text)
-        if parsed is not None:
-            votes[path].append(parsed)
-
-    # Aggregate: drop internally inconsistent reads (unless that leaves nothing),
-    # take the per-field majority, then sum across receipts with exact Decimal math.
     total_paid = Decimal("0")
     total_without_discount = Decimal("0")
     for path in images:
@@ -371,8 +351,8 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
         total_paid += _quantize(paid)
         total_without_discount += _quantize(subtotal + discount)
         print(
-            f"[hw1] {path.name}: paid={_quantize(paid)} subtotal={_quantize(subtotal)} "
-            f"discount={_quantize(discount)} (votes={len(usable)}/{len(reads)})"
+            f"{path.name}: paid={_quantize(paid)} subtotal={_quantize(subtotal)} "
+            f"discount={_quantize(discount)} votes={len(usable)}/{len(reads)}"
         )
 
     return {

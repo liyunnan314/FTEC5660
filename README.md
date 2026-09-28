@@ -102,12 +102,13 @@ Two guards sit between the model and the total. First a **self-consistency
 check**: the listed `discount_lines` must re-add to `discount_total`, and
 `amount_without_discounts` must equal `subtotal + discount_total`. Any read
 that breaks either identity has certainly mis-read a line and is dropped before
-voting. Second, **adaptive re-voting**: a receipt whose reads disagree by more
-than one cent, whose payment differs from its subtotal by more than a plausible
-rounding amount, or which produced an inconsistent read, gets four more plain
-reads. Seven votes were chosen because a wrong majority always shows up as
-disagreement, so it always triggers the extra round, and eleven votes are far
-harder to sway than five.
+voting. Second, **adaptive re-voting**: after the first seven reads, a receipt is voted
+on again whenever its reads disagree by more than a cent, when a read fails the
+self-consistency check, when its payment differs from its subtotal by more than
+a plausible rounding amount, or when the leading value has less than 60% of the
+votes. Re-voting repeats (four more reads at a time, up to 21 per receipt) until
+one value clearly dominates. The 60% rule matters because a 4-3 split is exactly
+where a wrong majority can hide.
 
 Surviving votes are combined per field by **majority rather than by median**.
 Reading a receipt is a transcription task with discrete answers, so if two
