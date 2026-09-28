@@ -48,6 +48,86 @@ DeepSeek Flash model. JPEG, PNG, GIF, and WebP inputs are accepted by the
 homework runner.
 
 
-## Homework 1 solution: 
-> to students: please fill your solution description here.
+## Homework 1 solution:
+
+### Chain design
+
+```mermaid
+flowchart TD
+    IMG["Receipt folder<br/>jpg / png / gif / webp"] --> PASS1
+
+    subgraph PASS1["Pass 1 - seven parallel reads, one LangChain chain"]
+        direction LR
+        V1["read 1..7"] --> J["JSON: subtotal, discount_total,<br/>discount_lines, paid, without-discount"]
+    end
+
+    J --> CHK{"self-checks:<br/>discount_lines re-add to discount_total?<br/>without-discount = subtotal + discount?<br/>reads agree within 1c?"}
+
+    CHK -- "no" --> PASS2["Pass 2 - adaptive re-voting:<br/>four more plain reads"]
+    PASS2 --> MED
+    CHK -- "yes" --> MED
+
+    MED["drop inconsistent reads,<br/>take per-field majority"] --> SUM["exact Decimal sum<br/>across every receipt"]
+
+    SUM --> Q1["Q1 = sum of amount_paid_after_rounding"]
+    SUM --> Q2["Q2 = sum of subtotal + discount_total"]
+
+    Q1 --> OUT["results.csv<br/>each cell holds exactly one number"]
+    Q2 --> OUT
+```
+
+### How it works
+
+The whole solution lives in the two marked functions of `hw1.py`.
+`build_chain()` wires up one LCEL chain - a `RunnableLambda` that turns a
+receipt path into a multimodal `HumanMessage` (the extraction prompt plus the
+image as a base64 data URL), then `ChatDeepSeek` with
+`deepseek-v4-flash-vision-exp`, then a `StrOutputParser` - so the model and the
+prompt are created exactly once.
+
+`answer_queries()` never trusts the model with arithmetic. It asks the chain
+for **seven independent structured reads** of every receipt, each returning a
+strict JSON object with four numeric fields plus a list:
+`amount_paid_after_rounding` (the payment line right after `ROUNDING`, used for
+Q1), `subtotal_after_discounts_before_rounding` (the `小計` line),
+`discount_total` (every promotion, coupon, member, app and packaging-damage
+line added back as a positive number - explicitly excluding `ROUNDING`, change
+and payment lines), `amount_without_discounts`, and `discount_lines` (every
+discount line listed with its printed label and its printed amount, so the
+total can be re-added and the label cannot be confused with the amount column).
+Because LangChain's `batch` runs those reads concurrently, the extra votes cost
+wall-clock time, not accuracy.
+
+Two guards sit between the model and the total. First a **self-consistency
+check**: the listed `discount_lines` must re-add to `discount_total`, and
+`amount_without_discounts` must equal `subtotal + discount_total`. Any read
+that breaks either identity has certainly mis-read a line and is dropped before
+voting. Second, **adaptive re-voting**: a receipt whose reads disagree by more
+than one cent, whose payment differs from its subtotal by more than a plausible
+rounding amount, or which produced an inconsistent read, gets four more plain
+reads. Seven votes were chosen because a wrong majority always shows up as
+disagreement, so it always triggers the extra round, and eleven votes are far
+harder to sway than five.
+
+Surviving votes are combined per field by **majority rather than by median**.
+Reading a receipt is a transcription task with discrete answers, so if two
+reads say 76.71 and one says 100.21 the truth is 76.71 - whereas a median can
+average two different readings into an amount that never appeared on the paper.
+The median is kept only as a tie-break. The agreed per-receipt figures then
+feed an exact `Decimal` summation on the host, which is what actually answers
+the two questions.
+
+This design keeps the LLM doing only what it is good at (reading a photographed
+receipt) and pushes all counting, rounding and addition into deterministic
+Python code, so a single mis-read digit cannot silently shift the total. Each
+final response is formatted as a single `HK$` amount, satisfying the "exactly
+one number per response" rule.
+
+### Measured behaviour
+
+On the seven `public_test` receipts both queries score `correct`
+(`HK$1974.30` and `HK$2348.20`) and every per-receipt figure matches
+`ground_truth.json`. Repeated runs and re-combined subsets of the public
+receipts were used to check stability, since grading uses three independent
+runs over an unseen folder.
 
